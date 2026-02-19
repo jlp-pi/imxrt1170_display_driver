@@ -269,17 +269,24 @@ void lv_port_disp_init(void) {
 
     // Changes in master (v9 development) https://github.com/lvgl/lvgl/issues/4011
 
-    lv_display_t * disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
-
-    // Set color format to RGB565
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-
-    lv_display_set_flush_cb(disp, (void *)DEMO_FlushDisplay);
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
-
     #if DEMO_USE_ROTATE
+    /* Tell LVGL the display is landscape (LVGL_BUFFER_WIDTH x LVGL_BUFFER_HEIGHT = 1200x720).
+     * Do NOT call lv_display_set_rotation(): in LVGL v9 that causes LVGL to internally
+     * rotate the rendered output to physical portrait layout in the buffer (stride = 720*2 =
+     * 1440), while our C flush callback expects landscape layout (stride = 1200*2 = 2400).
+     * Applying both rotations produces garbled banded output.
+     * With no set_rotation(), LVGL renders landscape directly; the flush callback rotates
+     * once (270°) to portrait for the display controller. */
+    lv_display_t * disp = lv_display_create(LVGL_BUFFER_WIDTH, LVGL_BUFFER_HEIGHT);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_flush_cb(disp, (void *)DEMO_FlushDisplay);
     lv_display_set_buffers(disp, s_lvglBuffer[0], NULL, DEMO_BUFFER_WIDTH*DEMO_BUFFER_HEIGHT*DEMO_BUFFER_BYTE_PER_PIXEL, LCD_RENDER_MODE);
     #else
+    lv_display_t * disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_flush_cb(disp, (void *)DEMO_FlushDisplay);
+    /* No set_rotation: LVGL renders portrait (720x1200) directly into s_frameBuffer.
+     * The flush callback passes it straight to the LCD controller — no C rotation step. */
     lv_display_set_buffers(disp, s_frameBuffer[0], s_frameBuffer[1], DEMO_BUFFER_WIDTH*DEMO_BUFFER_HEIGHT*DEMO_BUFFER_BYTE_PER_PIXEL, LCD_RENDER_MODE);
     #endif
 
@@ -348,15 +355,6 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
 
     bool is_last = lv_disp_flush_is_last(disp_drv);
 
-    static bool firstFlushDiag = true;
-    if (firstFlushDiag) {
-        firstFlushDiag = false;
-        PRINTF("DEMO_FlushDisplay: is_last=%d color_p=%p\r\n", is_last, color_p);
-        uint16_t *px = (uint16_t *)color_p;
-        PRINTF("  px[0]=%04x px[1]=%04x px[center]=%04x\r\n",
-               px[0], px[1], px[LVGL_BUFFER_WIDTH * LVGL_BUFFER_HEIGHT / 2]);
-    }
-
     if (!is_last) {
         lv_disp_flush_ready(disp_drv);
         return;
@@ -395,9 +393,12 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
     int32_t w = LVGL_BUFFER_WIDTH; //lv_area_get_width(area);
     int32_t h = LVGL_BUFFER_HEIGHT; //lv_area_get_height(area);
     lv_color_format_t cf = lv_display_get_color_format(disp_drv);
-    // uint32_t px_size = lv_color_format_get_size(cf);
-    uint32_t w_stride = lv_draw_buf_width_to_stride(w, cf);
-    uint32_t h_stride = lv_draw_buf_width_to_stride(h, cf);
+    /* lv_draw_sw_rotate has no case for LV_COLOR_FORMAT_RGB565_SWAPPED — it falls
+     * through to default: break and silently does nothing.  Both variants are 2 bytes/pixel
+     * so pass plain RGB565; the byte-swap is preserved unchanged through the pixel copy. */
+    lv_color_format_t rotate_cf = (cf == LV_COLOR_FORMAT_RGB565_SWAPPED) ? LV_COLOR_FORMAT_RGB565 : cf;
+    uint32_t w_stride = lv_draw_buf_width_to_stride(w, rotate_cf);
+    uint32_t h_stride = lv_draw_buf_width_to_stride(h, rotate_cf);
 
     lv_display_rotation_t rotation = LV_DISPLAY_ROTATION_270;
 
@@ -422,11 +423,11 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
     // lv_opa_t opa = LV_OPA_COVER;
     // // lv_disp_rot_t angle = LV_DISP_ROT_270;
 
-    lv_draw_pxp_rotate(color_p, dest_buf, w, h, w_stride, dest_stride, rotation, cf);
+    lv_draw_pxp_rotate(color_p, dest_buf, w, h, w_stride, dest_stride, rotation, rotate_cf);
     // lv_gpu_nxp_pxp_wait();
 
     #else /* Use CPU to rotate the panel. */
-    lv_draw_sw_rotate(color_p, dest_buf, w, h, w_stride, dest_stride, rotation, cf);
+    lv_draw_sw_rotate(color_p, dest_buf, w, h, w_stride, dest_stride, rotation, rotate_cf);
 
     // for (uint32_t y = 0; y < LVGL_BUFFER_HEIGHT; y++)
     // {
@@ -437,6 +438,7 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
     //     }
     // }
     #endif
+
 
 #if __CORTEX_M == 4
     L1CACHE_CleanInvalidateSystemCacheByRange((uint32_t)s_inactiveFrameBuffer, DEMO_FB_SIZE);
