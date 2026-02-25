@@ -278,16 +278,21 @@ void lv_port_disp_init(void) {
      * With no set_rotation(), LVGL renders landscape directly; the flush callback rotates
      * once (270°) to portrait for the display controller. */
     lv_display_t * disp = lv_display_create(LVGL_BUFFER_WIDTH, LVGL_BUFFER_HEIGHT);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     lv_display_set_flush_cb(disp, (void *)DEMO_FlushDisplay);
     lv_display_set_buffers(disp, s_lvglBuffer[0], NULL, DEMO_BUFFER_WIDTH*DEMO_BUFFER_HEIGHT*DEMO_BUFFER_BYTE_PER_PIXEL, LCD_RENDER_MODE);
     #else
     lv_display_t * disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     lv_display_set_flush_cb(disp, (void *)DEMO_FlushDisplay);
     /* No set_rotation: LVGL renders portrait (720x1200) directly into s_frameBuffer.
-     * The flush callback passes it straight to the LCD controller — no C rotation step. */
-    lv_display_set_buffers(disp, s_frameBuffer[0], s_frameBuffer[1], DEMO_BUFFER_WIDTH*DEMO_BUFFER_HEIGHT*DEMO_BUFFER_BYTE_PER_PIXEL, LCD_RENDER_MODE);
+     * Use FULL render mode (not DIRECT) to avoid double-buffer dirty-area sync complexity.
+     * Two buffers kept for tearing-free display switching. */
+    PRINTF("s_frameBuffer[0]=%p s_frameBuffer[1]=%p\r\n", s_frameBuffer[0], s_frameBuffer[1]);
+    /* Single buffer: LVGL does ONE flush per lv_refr_now(), avoiding the
+     * double-flush deadlock where the 2nd xSemaphoreTake never gets a Give.
+     * s_frameBuffer[1] is still shown initially by lv_port_pre_init(). */
+    lv_display_set_buffers(disp, s_frameBuffer[0], NULL, DEMO_BUFFER_WIDTH*DEMO_BUFFER_HEIGHT*DEMO_BUFFER_BYTE_PER_PIXEL, LV_DISPLAY_RENDER_MODE_FULL);
     #endif
 
 #if LV_USE_GPU_NXP_VG_LITE
@@ -370,10 +375,14 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
      */
 
     static bool firstFlush = true;
+    static int rotateFlushCount = 0;
 
     /* Only wait for the first time. */
     if (firstFlush) {
         firstFlush = false;
+        uint32_t disp_para = LCDIFV2->DISP_PARA;
+        PRINTF("DBG ROTATE: DISP_PARA=0x%08X LINE_PATTERN=%u (0=RGB,1=RBG,2=GBR,3=GRB,4=BRG,5=BGR)\r\n",
+               disp_para, (unsigned)((disp_para >> 26) & 0x7U));
     } else {
         /* Wait frame buffer. */
         DEMO_WaitBufferSwitchOff();
@@ -404,40 +413,29 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
 
     uint32_t dest_stride = (rotation == LV_DISPLAY_ROTATION_270 || rotation == LV_DISPLAY_ROTATION_90) ? h_stride : w_stride;
 
+    /* Invalidate CPU cache for the source LVGL buffer before SW rotate reads it.
+     * PXP writes to SDRAM directly (bypassing CPU cache); if SW rotate reads
+     * stale CPU cache from a previous render, it would copy wrong pixel values.
+     * This flush+invalidate ensures SW rotate always sees PXP-written SDRAM data. */
+#if __CORTEX_M == 4
+    L1CACHE_CleanInvalidateSystemCacheByRange((uint32_t)color_p, DEMO_FB_SIZE);
+#else
+    SCB_CleanInvalidateDCache_by_Addr(color_p, DEMO_FB_SIZE);
+#endif
 
-    #if LV_USE_GPU_NXP_PXP /* Use PXP to rotate the panel. */
-    // lv_area_t dest_area = {
-    //     .x1 = 0,
-    //     .x2 = DEMO_BUFFER_HEIGHT - 1,
-    //     .y1 = 0,
-    //     .y2 = DEMO_BUFFER_WIDTH - 1,
-    // };
+    /* Sample source pixels for diagnostic: check a pixel in the RED rectangle area.
+     * LVGL landscape (1200x720): RED rect is centered, ~w=200 h=60, at (500,330) to (700,390).
+     * Sample at landscape (600, 360) = center. */
+    uint16_t *src_px = (uint16_t *)color_p;
+    uint16_t sample = src_px[360 * 1200 + 600];
+    PRINTF("ROTATE FLUSH#%d: color_p=%p src[360*1200+600]=0x%04X inactive=%p\r\n",
+           rotateFlushCount, color_p, sample, inactiveFrameBuffer);
+    rotateFlushCount++;
 
-    // const lv_color_t * src_buf = color_p;
-    // const lv_area_t * dest_area = &dest_area;
-    // lv_coord_t dest_stride = DEMO_BUFFER_WIDTH;
-    // const lv_area_t * src_area = area;
-    // int32_t src_width = 
-    // int32_t src_height = lv_area_get_height(area);
-    // lv_coord_t src_stride = lv_area_get_width(area);
-    // lv_opa_t opa = LV_OPA_COVER;
-    // // lv_disp_rot_t angle = LV_DISP_ROT_270;
-
-    lv_draw_pxp_rotate(color_p, dest_buf, w, h, w_stride, dest_stride, rotation, rotate_cf);
-    // lv_gpu_nxp_pxp_wait();
-
-    #else /* Use CPU to rotate the panel. */
+    /* SW rotation: diagnostic step to bypass PXP rotation and isolate colour issue.
+     * If colours are correct here, PXP rotation was byte-swapping; if still wrong,
+     * the issue is in PXP fill (need to disable LV_USE_DRAW_PXP). */
     lv_draw_sw_rotate(color_p, dest_buf, w, h, w_stride, dest_stride, rotation, rotate_cf);
-
-    // for (uint32_t y = 0; y < LVGL_BUFFER_HEIGHT; y++)
-    // {
-    //     for (uint32_t x = 0; x < LVGL_BUFFER_WIDTH; x++)
-    //     {
-    //         ((uint16_t *)inactiveFrameBuffer)[(DEMO_BUFFER_HEIGHT - x) * DEMO_BUFFER_WIDTH + y] =
-    //             ((uint16_t *)color_p)[y * LVGL_BUFFER_WIDTH + x];
-    //     }
-    // }
-    #endif
 
 
 #if __CORTEX_M == 4
@@ -454,6 +452,54 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
 
     #else /* DEMO_USE_ROTATE */
 
+    static int flushCount = 0;
+
+    if (flushCount == 0) {
+        uint32_t disp_para = LCDIFV2->DISP_PARA;
+        PRINTF("DBG: DISP_PARA=0x%08X LINE_PATTERN=%u (0=RGB,1=RBG,2=GBR,3=GRB,4=BRG,5=BGR)\r\n",
+               disp_para, (unsigned)((disp_para >> 26) & 0x7U));
+    }
+
+    /* Alternate between Y-gradient and X-gradient on successive test() calls.
+     * Y-GRADIENT (even flushes): confirms whether buffer Y maps to display Y or X.
+     *   Top 1/3 (y<400):  0xF800 (red in RGB565 / blue in BGR565)
+     *   Mid 1/3 (y<800):  0x07E0 (green — same in RGB565 and BGR565)
+     *   Bot 1/3 (y>=800): 0x001F (blue in RGB565 / red in BGR565)
+     * X-GRADIENT (odd flushes): confirms whether buffer X maps to display X or Y.
+     *   Left 1/3 (x<240): 0xF800
+     *   Mid 1/3 (x<480):  0x07E0
+     *   Rgt 1/3 (x>=480): 0x001F
+     * Expected if portrait-correct: Y-grad → 3 horizontal bands; X-grad → 3 vertical bands.
+     * Expected if 90° rotated:      Y-grad → 3 vertical bands;   X-grad → 3 horizontal bands. */
+    uint16_t *px = (uint16_t *)color_p;
+    if ((flushCount & 1) == 0) {
+        /* Y-gradient */
+        for (int y = 0; y < 1200; y++) {
+            uint16_t c = (y < 400) ? 0xF800 : (y < 800) ? 0x07E0 : 0x001F;
+            for (int x = 0; x < 720; x++)
+                px[x + y*720] = c;
+        }
+    } else {
+        /* X-gradient */
+        for (int y = 0; y < 1200; y++) {
+            for (int x = 0; x < 720; x++) {
+                uint16_t c = (x < 240) ? 0xF800 : (x < 480) ? 0x07E0 : 0x001F;
+                px[x + y*720] = c;
+            }
+        }
+    }
+
+    PRINTF("FLUSH#%d PATTERN=%s area=(%d,%d,%d,%d) color_p=%p\r\n",
+           flushCount, ((flushCount & 1) == 0) ? "Y-GRAD" : "X-GRAD",
+           area->x1, area->y1, area->x2, area->y2, color_p);
+    if ((flushCount & 1) == 0) {
+        PRINTF("  Y-GRAD: @(360,200)=%04x(exp F800) @(360,600)=%04x(exp 07E0) @(360,1000)=%04x(exp 001F)\r\n",
+               px[360+200*720], px[360+600*720], px[360+1000*720]);
+    } else {
+        PRINTF("  X-GRAD: @(120,600)=%04x(exp F800) @(360,600)=%04x(exp 07E0) @(600,600)=%04x(exp 001F)\r\n",
+               px[120+600*720], px[360+600*720], px[600+600*720]);
+    }
+
 #if __CORTEX_M == 4
     L1CACHE_CleanInvalidateSystemCacheByRange((uint32_t)color_p, DEMO_FB_SIZE);
 #else
@@ -461,8 +507,16 @@ void DEMO_FlushDisplay(lv_display_t * disp_drv, const lv_area_t * area, uint8_t 
 #endif
 
     g_dc.ops->setFrameBuffer(&g_dc, 0, (void *)color_p);
-
+    /* Wait for the LCDIFV2 vsync ISR to confirm the buffer switch.
+     * Safe with single-buffer mode: LVGL calls flush exactly once per
+     * lv_refr_now(), so WaitBufferSwitchOff takes exactly one semaphore
+     * give and returns — no deadlock.  Without this wait the unreceived
+     * portYIELD_FROM_ISR in DEMO_BufferSwitchOffCallback disrupts the
+     * FreeRTOS scheduler and causes subsequent time.sleep() calls to hang. */
     DEMO_WaitBufferSwitchOff();
+
+    PRINTF("  setFrameBuffer done (flush#%d)\r\n", flushCount);
+    flushCount++;
 
     /* IMPORTANT!!!
      * Inform the graphics library that you are ready with the flushing*/

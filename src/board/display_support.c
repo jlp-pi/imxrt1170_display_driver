@@ -251,7 +251,11 @@ static const dc_fb_lcdifv2_config_t s_dcFbLcdifv2Config = {
     .vfp           = DEMO_VFP,
     .vbp           = DEMO_VBP,
     .polarityFlags = DEMO_LCDIF_POL_FLAGS,
-    .lineOrder     = kLCDIFV2_LineOrderRGB,
+    /* WF50DTYA3MNG10000 NVM configures the ILI9881C subpixel order as G-R-B:
+     * DSI byte0 → GREEN subpixel, byte1 → RED, byte2 → BLUE.
+     * kLCDIFV2_LineOrderGRB sends [G_fb, R_fb, B_fb] so each subpixel
+     * receives the correct channel value. */
+    .lineOrder     = kLCDIFV2_LineOrderGRB,
 /* CM4 is domain 1, CM7 is domain 0. */
 #if (__CORTEX_M <= 4)
     .domain = 1,
